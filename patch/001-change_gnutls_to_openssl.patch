@@ -1,0 +1,841 @@
+--- a/httpfs2.c	2012-09-03 22:58:02.000000000 +0800
++++ b/httpfs2.c	2020-07-15 17:06:00.178782264 +0800
+@@ -44,6 +44,8 @@
+ #include <time.h>
+ #include <stddef.h>
+ #include <inttypes.h>
++#include <assert.h>
++#include <signal.h>
+ 
+ #ifdef USE_THREAD
+ #include <pthread.h>
+@@ -54,8 +56,16 @@
+ #endif
+ 
+ #ifdef USE_SSL
+-#include <gnutls/gnutls.h>
+-#include <gnutls/x509.h>
++#include <openssl/ssl.h>
++#include <openssl/bio.h>
++#include <openssl/err.h>
++#include <openssl/pem.h>
++#include <openssl/conf.h>
++#include <openssl/x509.h>
++#include <openssl/buffer.h>
++#include <openssl/x509v3.h>
++#include <openssl/opensslconf.h>
++#include <sys/select.h>
+ #endif
+ 
+ #define TIMEOUT 30
+@@ -63,6 +73,26 @@
+ #define HEADER_SIZE 1024
+ #define VERSION "0.1.5 \"The Message\""
+ 
++#ifndef UNUSED
++# define UNUSED(x) ((void)(x))
++#endif
++
++#define RETURN_NULL(x) if ((x)==NULL) exit (1)
++#define RETURN_ERR(err,s) if ((err)==-1) { perror(s); exit(1); }
++#define RETURN_SSL(err) if ((err)==-1) { ERR_print_errors_fp(stderr); exit(1); }
++
++#   define apps_startup() \
++                        do { do_pipe_sig(); CRYPTO_malloc_init(); \
++                        ERR_load_crypto_strings(); OpenSSL_add_all_algorithms(); \
++                        ENGINE_load_builtin_engines(); setup_ui_method(); } while(0)
++
++ #  define ASSERT(x) { \
++  if(!(x)) { \
++    fprintf(stderr, "Assertion: %s: function %s, line %d\n", (char*)(__FILE__), (char*)(__func__), (int)__LINE__); \
++    raise(SIGTRAP); \
++  } \
++}
++
+ static char* argv0;
+ 
+ #define MAX_REQUEST (32*1024)
+@@ -91,9 +121,23 @@
+     unsigned md2;
+     int ssl_initialized;
+     int ssl_connected;
+-    gnutls_certificate_credentials_t sc;
+-    gnutls_session_t ss;
++    SSL_CTX *ctx;
++    BIO *web;
++    BIO *out;
++    BIO *sbio;
++    SSL *ssl;
++    X509* cert;
+     const char * cafile;
++
++    BIO *bio_err;
++    BIO *bio_c_out;
++    int read_ssl;
++    int write_ssl;
++    int ssl_pending;
++    int width;
++    int in_init;
++    fd_set readfds;
++    fd_set writefds;
+ #endif
+     char * req_buf;
+     size_t req_buf_size;
+@@ -101,8 +145,19 @@
+     time_t last_modified;
+ } struct_url;
+ 
++const char* const PREFERRED_CIPHERS = "HIGH:!aNULL:!kRSA:!SRP:!PSK:!CAMELLIA:!RC4:!MD5:!DSS";
++
+ static struct_url main_url;
+ 
++static void plain_report(const char * reason, const char * method, \
++        const char * buf, size_t len);
++
++static ssize_t parse_header(struct_url *url, const char * buf, size_t bytes, \
++        const char * method, off_t * content_length, int expect);
++
++static ssize_t exchange(struct_url *, char * buf, const char * method, \
++        off_t * content_length, off_t start, off_t end, size_t * header_length);
++
+ static off_t get_stat(struct_url*, struct stat * stbuf);
+ static ssize_t get_data(struct_url*, off_t start, size_t size);
+ static int open_client_socket(struct_url *url);
+@@ -110,6 +165,12 @@
+ static int close_client_force(struct_url *url);
+ static struct_url * thread_setup(void);
+ static void destroy_url_copy(void *);
++static void cleanup(struct_url *url);
++static int verify_callback(int preverify, X509_STORE_CTX* x509_ctx);
++static void print_cn_name(const char* label, X509_NAME* const name);
++static void print_san_name(const char* label, X509* const cert);
++
++
+ 
+ /* Protocol symbols. */
+ #define PROTO_HTTP 0
+@@ -396,256 +457,11 @@
+ #ifdef USE_SSL
+ 
+ static void errno_report(const char * where);
+-static void ssl_error(int error, gnutls_session_t ss, const char * where);
+-/* Functions to deal with gnutls_datum_t stolen from gnutls docs.
+- * The structure does not seem documented otherwise.
+- */
+-static gnutls_datum_t
+-load_file (const char *file)
+-{
+-    FILE *f;
+-    gnutls_datum_t loaded_file = { NULL, 0 };
+-    long filelen;
+-    void *ptr;
+-    f = fopen (file, "r");
+-    if (!f)
+-        errno_report(file);
+-    else if (fseek (f, 0, SEEK_END) != 0)
+-        errno_report(file);
+-    else if ((filelen = ftell (f)) < 0)
+-        errno_report(file);
+-    else if (fseek (f, 0, SEEK_SET) != 0)
+-        errno_report(file);
+-    else if (!(ptr = malloc ((size_t) filelen)))
+-        errno_report(file);
+-    else if (fread (ptr, 1, (size_t) filelen, f) < (size_t) filelen)
+-        errno_report(file);
+-    else {
+-        loaded_file.data = ptr;
+-        loaded_file.size = (unsigned int) filelen;
+-        fprintf(stderr, "Loaded '%s' %ld bytes\n", file, filelen);
+-        /* fwrite(ptr, filelen, 1, stderr); */
+-    }
+-    return loaded_file;
+-}
+-
+-static void
+-unload_file (gnutls_datum_t data)
+-{
+-    free (data.data);
+-}
+-
+-/* This function will print some details of the
+- * given session.
+- *
+- * Stolen from the GNUTLS docs.
+- */
+-    int
+-print_ssl_info (gnutls_session_t session)
+-{
+-    const char *tmp;
+-    gnutls_credentials_type_t cred;
+-    gnutls_kx_algorithm_t kx;
+-    int dhe, ecdh;
+-    dhe = ecdh = 0;
+-    /* print the key exchange’s algorithm name
+-    */
+-    kx = gnutls_kx_get (session);
+-    tmp = gnutls_kx_get_name (kx);
+-    printf ("- Key Exchange: %s\n", tmp);
+-    /* Check the authentication type used and switch
+-     * to the appropriate.
+-     */
+-    cred = gnutls_auth_get_type (session);
+-    switch (cred)
+-    {
+-        case GNUTLS_CRD_CERTIFICATE:
+-            /* certificate authentication */
+-            /* Check if we have been using ephemeral Diffie-Hellman.
+-            */
+-            if (kx == GNUTLS_KX_DHE_RSA || kx == GNUTLS_KX_DHE_DSS)
+-                dhe = 1;
+-#if (GNUTLS_VERSION_MAJOR > 3 )
+-            else if (kx == GNUTLS_KX_ECDHE_RSA || kx == GNUTLS_KX_ECDHE_ECDSA)
+-                ecdh = 1;
+-#endif
+-            /* cert should have been printed when it was verified */
+-            break;
+-        default:
+-            printf("Not a x509 sesssion !?!\n");
+-
+-    }
+-#if (GNUTLS_VERSION_MAJOR > 3 )
+-    /* switch */
+-    if (ecdh != 0)
+-        printf ("- Ephemeral ECDH using curve %s\n",
+-                gnutls_ecc_curve_get_name (gnutls_ecc_curve_get (session)));
+-    else
+-#endif
+-        if (dhe != 0)
+-            printf ("- Ephemeral DH using prime of %d bits\n",
+-                    gnutls_dh_get_prime_bits (session));
+-    /* print the protocol’s name (ie TLS 1.0)
+-    */
+-    tmp = gnutls_protocol_get_name (gnutls_protocol_get_version (session));
+-    printf ("- Protocol: %s\n", tmp);
+-    /* print the certificate type of the peer.
+-     * ie X.509
+-     */
+-    tmp =
+-        gnutls_certificate_type_get_name (gnutls_certificate_type_get (session));
+-    printf ("- Certificate Type: %s\n", tmp);
+-    /* print the compression algorithm (if any)
+-    */
+-    tmp = gnutls_compression_get_name (gnutls_compression_get (session));
+-    printf ("- Compression: %s\n", tmp);
+-    /* print the name of the cipher used.
+-     * ie 3DES.
+-     */
+-    tmp = gnutls_cipher_get_name (gnutls_cipher_get (session));
+-    printf ("- Cipher: %s\n", tmp);
+-    /* Print the MAC algorithms name.
+-     * ie SHA1
+-     */
+-    tmp = gnutls_mac_get_name (gnutls_mac_get (session));
+-    printf ("- MAC: %s\n", tmp);
+-    printf ("Note: SSL paramaters may change as new connections are established to the server.\n");
+-    return 0;
+-}
+-
+-
+-
+-/* This function will try to verify the peer’s certificate, and
+- * also check if the hostname matches, and the activation, expiration dates.
+- *
+- * Stolen from the gnutls manual.
+- */
+-static int
+-verify_certificate_callback (gnutls_session_t session)
+-{
+-    unsigned int status;
+-    const gnutls_datum_t *cert_list;
+-    unsigned int cert_list_size;
+-    int ret;
+-    gnutls_x509_crt_t cert;
+-    gnutls_datum_t data = {0};
+-    struct_url * url = gnutls_session_get_ptr (session);
+-    const char *hostname = url->host;
+-
+-    /* This verification function uses the trusted CAs in the credentials
+-     * structure. So you must have installed one or more CA certificates.
+-     */
+-    ret = gnutls_certificate_verify_peers2 (session, &status);
+-    if (ret < 0)
+-    {
+-        ssl_error(ret, session, "verify certificate");
+-        return GNUTLS_E_CERTIFICATE_ERROR;
+-    }
+-    if (status & GNUTLS_CERT_INVALID)
+-        printf ("The server certificate is NOT trusted.\n");
+-    if (status & GNUTLS_CERT_INSECURE_ALGORITHM)
+-        printf ("The server certificate uses an insecure algorithm.\n");
+-    if (status & GNUTLS_CERT_SIGNER_NOT_FOUND)
+-        printf ("The server certificate hasn’t got a known issuer.\n");
+-    if (status & GNUTLS_CERT_REVOKED)
+-        printf ("The server certificate has been revoked.\n");
+-    if (status & GNUTLS_CERT_EXPIRED)
+-        printf ("The server certificate has expired\n");
+-    if (status & GNUTLS_CERT_NOT_ACTIVATED)
+-        printf ("The server certificate is not yet activated\n");
+-    /* Up to here the process is the same for X.509 certificates and
+-     * OpenPGP keys. From now on X.509 certificates are assumed. This can
+-     * be easily extended to work with openpgp keys as well.
+-     */
+-    if (gnutls_certificate_type_get (session) != GNUTLS_CRT_X509)
+-        return GNUTLS_E_CERTIFICATE_ERROR;
+-    if (gnutls_x509_crt_init (&cert) < 0)
+-    {
+-        ssl_error(ret, session, "verify certificate");
+-        return GNUTLS_E_CERTIFICATE_ERROR;
+-    }
+-    cert_list = gnutls_certificate_get_peers (session, &cert_list_size);
+-    if (cert_list == NULL)
+-    {
+-        printf ("No server certificate was found!\n");
+-        return GNUTLS_E_CERTIFICATE_ERROR;
+-    }
+-    /* Check the hostname matches the certificate.
+-     */
+-    ret = gnutls_x509_crt_import (cert, &cert_list[0], GNUTLS_X509_FMT_DER);
+-    if (ret < 0)
+-    {
+-        ssl_error(ret, session, "parsing certificate");
+-        return GNUTLS_E_CERTIFICATE_ERROR;
+-    }
+-    if (!(url->ssl_connected)) if (!gnutls_x509_crt_print (cert, GNUTLS_CRT_PRINT_FULL, &data)) {
+-        printf("%s", data.data);
+-        gnutls_free(data.data);
+-    }
+-    if (!hostname || !gnutls_x509_crt_check_hostname (cert, hostname))
+-    {
+-        int found = 0;
+-        if (hostname) {
+-            int i;
+-            size_t len = strlen(hostname);
+-            if (*(hostname+len-1) == '.') len--;
+-            if (!(url->ssl_connected)) printf ("Server hostname verification failed. Trying to peek into the cert.\n");
+-            for (i=0;;i++) {
+-                char * dn = NULL;
+-                size_t dn_size = 0;
+-                int dn_ret = 0;
+-                int match=0;
+-                gnutls_x509_crt_get_dn_by_oid(cert, GNUTLS_OID_X520_COMMON_NAME, i, 0, dn, &dn_size);
+-                if (dn_size) dn = malloc(dn_size + 1); /* nul not counted */
+-                if (dn)
+-                    dn_ret = gnutls_x509_crt_get_dn_by_oid(cert, GNUTLS_OID_X520_COMMON_NAME, i, 0, dn, &dn_size);
+-                if (!dn_ret){
+-                    if (dn) {
+-                        if (*(dn+dn_size-1) == '.') dn_size--;
+-                        if (len == dn_size)
+-                            match = ! strncmp(dn, hostname, len);
+-                        if (match) found = 1;
+-                        if (!(url->ssl_connected)) printf("Cert CN(%i): %s: %c\n", i, dn, match?'*':'X');
+-                    }}
+-                else
+-                    ssl_error(dn_ret, session, "getting cert subject data");
+-                if (dn) free(dn);
+-                if (dn_ret || !dn)
+-                    break;
+-            }
+-        }
+-        if(!found){
+-            printf ("The server certificate’s owner does not match hostname ’%s’\n",
+-                    hostname);
+-            return GNUTLS_E_CERTIFICATE_ERROR;
+-        }
+-    }
+-    gnutls_x509_crt_deinit (cert);
+-    /*
+-     * It the status includes GNUTLS_CERT_INVALID whenever
+-     * there is a problem and the other flags are just informative.
+-     */
+-    if (status & GNUTLS_CERT_INVALID)
+-        return GNUTLS_E_CERTIFICATE_ERROR;
+-    /* notify gnutls to continue handshake normally */
+-    return 0;
+-}
++static void ssl_error(int line, const char * desc);
+ 
+-
+-static void logfunc(int level, const char * str)
+-{
+-    fputs(str, stderr);
+-}
+-
+-static void ssl_error(int error, gnutls_session_t ss, const char * where)
++static void ssl_error(int line, const char * desc)
+ {
+-    const char * err_desc;
+-    if((error == GNUTLS_E_FATAL_ALERT_RECEIVED) || (error == GNUTLS_E_WARNING_ALERT_RECEIVED))
+-        err_desc = gnutls_alert_get_name(gnutls_alert_get(ss));
+-    else
+-        err_desc = gnutls_strerror(error);
+-
+-    fprintf(stderr, "%s: %s: %d %s.\n", argv0, where, error, err_desc);
++    fprintf(stderr, "[ssl_error] : Line %d : %s\n", line, desc);
+     errno = EIO; /* FIXME is this used anywhere? */
+ }
+ #endif
+@@ -667,15 +483,15 @@
+ 
+ static int init_url(struct_url* url)
+ {
+-    memset(url, 0, sizeof(url));
++    memset(url, 0, sizeof(struct_url));
+     url->sock_type = SOCK_CLOSED;
+     url->timeout = TIMEOUT;
+ #ifdef USE_SSL
+-    url->cafile = CERT_STORE;
++    url->cafile = NULL;
+ #endif
+     return 0;
+ }
+-
++#if 0
+ static int free_url(struct_url* url)
+ {
+     if(url->host) free(url->host);
+@@ -696,7 +512,7 @@
+     url->last_modified=0;
+     return 0;
+ }
+-
++#endif
+ static void print_url(FILE *f, const struct_url * url)
+ {
+     char * protocol = "?!?";
+@@ -866,10 +682,6 @@
+                           }
+                           break;
+ #ifdef USE_SSL
+-                case '2': main_url.md2 = GNUTLS_VERIFY_ALLOW_SIGN_RSA_MD2;
+-                          break;
+-                case '5': main_url.md5 = GNUTLS_VERIFY_ALLOW_SIGN_RSA_MD5;
+-                          break;
+                 case 'a': main_url.cafile = argv[1];
+                           shift;
+                           break;
+@@ -907,13 +719,14 @@
+     print_url(stderr, &main_url);
+     int sockfd = open_client_socket(&main_url);
+     if(sockfd < 0) {
++        cleanup(&main_url);
+         fprintf(stderr, "Connection failed.\n");
+         return 3;
+     }
+ #ifdef USE_SSL
+-    else {
+-        print_ssl_info(main_url.ss);
+-    }
++    //else {
++    //    print_ssl_info(main_url.ss);
++    //}
+ #endif
+     close_client_socket(&main_url);
+     struct stat st;
+@@ -1000,7 +813,9 @@
+  */
+ 
+ static int close_client_socket(struct_url *url) {
++    
+     if (url->sock_type == SOCK_KEEPALIVE) return SOCK_KEEPALIVE;
++
+     return close_client_force(url);
+ }
+ 
+@@ -1008,7 +823,7 @@
+     if(url->sock_type != SOCK_CLOSED){
+ #ifdef USE_SSL
+         if (url->proto == PROTO_HTTPS) {
+-            gnutls_deinit(url->ss);
++            cleanup(url);
+         }
+ #endif
+         close(url->sockfd);
+@@ -1051,15 +866,30 @@
+ 
+ 
+ static ssize_t read_client_socket(struct_url *url, void * buf, size_t len) {
+-    ssize_t res;
++    ssize_t res = 0;
+     struct timeval timeout;
+     timeout.tv_sec = url->timeout;
+     timeout.tv_usec = 0;
+     setsockopt(url->sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+ #ifdef USE_SSL
+     if (url->proto == PROTO_HTTPS) {
+-        res = gnutls_record_recv(url->ss, buf, len);
+-        if (res <= 0) ssl_error((int)res, url->ss, "read");
++        if (SSL_in_init(url->ssl) && !SSL_total_renegotiations(url->ssl)){
++                url->in_init = 1;
++        }
++        url->ssl_pending = url->read_ssl && SSL_pending(url->ssl);
++        
++        if(!url->ssl_pending){
++            res = SSL_read(url->ssl, buf, len);
++
++            if (res < 0){
++                ssl_error(__LINE__, "read");
++                SSL_get_error(url->ssl, res); 
++                fprintf(stderr, "read ERR_error_string : %s\n", ERR_error_string(res, NULL));
++                fprintf(stderr, "[%s] : %d, r SSL_get_error(url->ssl, res) %d\n", __func__, __LINE__, SSL_get_error(url->ssl, res));
++            }else if (res == 0){
++                return -2; //handle for restarting socket connection
++            }
++        }
+      } else
+ #endif
+     {
+@@ -1074,13 +904,26 @@
+ {
+     do {
+         int fd = open_client_socket(url);
+-        ssize_t res;
++        ssize_t res = 0;
+ 
+         if (fd < 0) return -1; /*error hopefully reported by open*/
+ #ifdef USE_SSL
+         if (url->proto == PROTO_HTTPS) {
+-            res = gnutls_record_send(url->ss, buf, len);
+-            if (res <= 0) ssl_error((int)res, url->ss, "write");
++            FD_ZERO(&url->writefds);
++            if (SSL_in_init(url->ssl) && !SSL_total_renegotiations(url->ssl)){
++                url->in_init = 1;
++            }
++            url->ssl_pending = url->read_ssl && SSL_pending(url->ssl);
++        
++            if (!url->ssl_pending) {
++                res = SSL_write(url->ssl, buf, len);
++                if (res <= 0){
++                ssl_error(__LINE__, "write");
++                SSL_get_error(url->ssl, res); 
++                fprintf(stderr, "write ERR_error_string : %s\n", ERR_error_string(res, NULL));
++                fprintf(stderr, "[%s] : %d, w SSL_get_error(url->ssl, res) %d\n", __func__, __LINE__, SSL_get_error(url->ssl, res));
++        }
++            }
+         /*
+          * It is suggested to retry GNUTLS_E_INTERRUPTED and GNUTLS_E_AGAIN
+          * However, retrying only causes delay in practice. FIXME
+@@ -1209,50 +1052,58 @@
+ 
+ #ifdef USE_SSL
+     if ((url->proto) == PROTO_HTTPS) {
+-        /* Make SSL connection. */
+-        int r = 0;
+-        const char * ps = "NORMAL"; /* FIXME allow user setting */
+-        const char * errp = NULL;
+-        if (!url->ssl_initialized) {
+-            r = gnutls_global_init();
+-            if (!r)
+-                r = gnutls_certificate_allocate_credentials (&url->sc); /* docs suggest to share creds */
+-            if (url->cafile) {
+-                if (!r)
+-                    r = gnutls_certificate_set_x509_trust_file (url->sc, url->cafile, GNUTLS_X509_FMT_PEM);
+-                if (r>0)
+-                    fprintf(stderr, "%s: SSL init: loaded %i CA certificate(s).\n", argv0, r);
+-                if (r>0) r = 0;
++        if (url->ssl_connected == 0){
++            const SSL_METHOD *meth = NULL;
++            url->bio_err = NULL;
++            url->bio_c_out = NULL;
++            
++            meth = SSLv23_client_method();
++
++            //apps_startup();
++            if (url->bio_err == NULL)
++                url->bio_err = BIO_new_fp(stderr, BIO_NOCLOSE);
++
++
++            OpenSSL_add_ssl_algorithms();
++            SSL_load_error_strings();
++
++            if (url->bio_c_out == NULL) {
++                url->bio_c_out = BIO_new_fp(stdout, BIO_NOCLOSE);
+             }
+-            if (!r)
+-                gnutls_certificate_set_verify_function (url->sc, verify_certificate_callback);
+-            gnutls_certificate_set_verify_flags (url->sc, GNUTLS_VERIFY_ALLOW_X509_V1_CA_CRT /* suggested */
+-                    | url->md5 | url->md2 ); /* oprional for old cert compat */
+-            if (!r) url->ssl_initialized = 1;
+-            gnutls_global_set_log_level((int)url->ssl_log_level);
+-            gnutls_global_set_log_function(&logfunc);
+-        }
+-        if (r) {
+-            ssl_error(r, url->ss, "SSL init");
+-            return -1;
+-        }
+ 
+-        r = gnutls_init(&url->ss, GNUTLS_CLIENT);
+-        if (!r) gnutls_session_set_ptr(url->ss, url); /* used in cert verifier */
+-        if (!r) r = gnutls_priority_set_direct(url->ss, ps, &errp);
+-        if (!r) r = gnutls_credentials_set(url->ss, GNUTLS_CRD_CERTIFICATE, url->sc);
+-        if (!r) gnutls_transport_set_ptr(url->ss, (gnutls_transport_ptr_t) (intptr_t) url->sockfd);
+-        if (!r) r = gnutls_handshake (url->ss); /* FIXME gnutls_error_is_fatal is recommended here */
+-        if (r) {
+-            close(url->sockfd);
+-            if (errp) fprintf(stderr, "%s: invalid SSL priority\n %s\n %*s\n", argv0, ps, (int)(errp - ps), "^");
+-            fprintf(stderr, "%s: %s:%d - ", argv0, url->host, url->port);
+-            ssl_error(r, url->ss, "SSL connection failed");
+-            gnutls_deinit(url->ss);
+-            errno = EIO;
+-            return -1;
+-        }
+-        url->ssl_connected = 1; /* Prevent printing cert data over and over again */
++            url->ctx = SSL_CTX_new(meth);
++
++            if (url->ctx == NULL) {
++                ERR_print_errors(url->bio_err);
++                cleanup(url);
++            }
++
++            SSL_CTX_set_verify(url->ctx, SSL_VERIFY_PEER, verify_callback);
++
++            if(!SSL_CTX_load_verify_locations(url->ctx, url->cafile, NULL))
++                ERR_print_errors(url->bio_err);
++
++            if (!SSL_CTX_set_default_verify_paths(url->ctx)) {
++                ERR_print_errors(url->bio_err);
++            }    
++
++
++            url->ssl = SSL_new(url->ctx);
++
++            url->sbio = BIO_new_socket(url->sockfd, BIO_NOCLOSE);
++
++            SSL_set_bio(url->ssl, url->sbio, url->sbio);
++            SSL_set_connect_state(url->ssl);
++
++
++            url->width = SSL_get_fd(url->ssl) + 1;
++
++            url->read_ssl = 1;
++            url->write_ssl = 1;
++
++     
++            url->ssl_connected = 1;
++        }     
+     }
+ #endif
+     return url->sock_type = SOCK_OPEN;
+@@ -1427,7 +1278,6 @@
+ #endif
+     bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes, "\r\n");
+ 
+-
+     /* Now actually send it. */
+     while(1){
+         /*
+@@ -1448,7 +1298,7 @@
+ #define CONNFAIL ((res <= 0) && ! errno) || (errno == EAGAIN) || (errno == EPIPE) || \
+         (url->retry_reset && (errno == ECONNRESET))
+ #else
+-#define CONNFAIL ((res <= 0) && ! errno) || (errno == EAGAIN) || (errno == EPIPE)
++#define CONNFAIL ((res <= 0) && ! errno) || (errno == EAGAIN) || (errno == EPIPE) 
+ #endif
+         errno = 0;
+         res = write_client_socket(url, buf, bytes);
+@@ -1461,11 +1311,17 @@
+             errno_report("exchange: failed to send request"); /* DEBUG */
+             return res;
+         }
++
+         res = read_client_socket(url, buf, HEADER_SIZE);
+         if (CONNFAIL) {
+             errno_report("exchange: did not receive a reply, retrying"); /* DEBUG */
+             close_client_force(url);
+             continue;
++        } else if (res == -2) {
++            SSL_shutdown(url->ssl);
++            SSL_set_connect_state(url->ssl);
++            close(url->sockfd);
++            continue;
+         } else if (res <= 0) {
+             errno_report("exchange: failed receving reply from server"); /* DEBUG */
+             return res;
+@@ -1473,7 +1329,6 @@
+         /* Not reached */
+     }
+     bytes = (size_t)res;
+-
+     res = parse_header(url, buf, bytes, method, content_length,
+             range ? 206 : 200);
+     if (res <= 0){
+@@ -1482,7 +1337,6 @@
+     }
+ 
+     if (header_length) *header_length = (size_t)res;
+-
+     return (ssize_t)bytes;
+ }
+ 
+@@ -1551,3 +1405,171 @@
+ 
+     return (ssize_t)(end - start) + 1 - (ssize_t)size;
+ }
++
++#ifdef USE_SSL
++
++void cleanup(struct_url *url){
++    
++    if(url->bio_c_out){
++        BIO_free(url->bio_c_out);
++        url->bio_c_out = NULL;
++    }
++        
++    if(url->web != NULL){
++        BIO_free_all(url->web);
++        url->web = NULL;
++    }
++        
++    if(NULL != url->ctx){
++        SSL_CTX_free(url->ctx);
++        url->ctx = NULL;
++    }
++    url->ssl_connected = 0; 
++}
++
++void print_cn_name(const char* label, X509_NAME* const name)
++{
++    int idx = -1, success = 0;
++    unsigned char *utf8 = NULL;
++    
++    do
++    {
++        if(!name) break; /* failed */
++        
++        idx = X509_NAME_get_index_by_NID(name, NID_commonName, -1);
++        if(!(idx > -1))  break; /* failed */
++        
++        X509_NAME_ENTRY* entry = X509_NAME_get_entry(name, idx);
++        if(!entry) break; /* failed */
++        
++        ASN1_STRING* data = X509_NAME_ENTRY_get_data(entry);
++        if(!data) break; /* failed */
++        
++        int length = ASN1_STRING_to_UTF8(&utf8, data);
++        if(!utf8 || !(length > 0))  break; /* failed */
++        
++        fprintf(stdout, "  %s: %s\n", label, utf8);
++        success = 1;
++        
++    } while (0);
++    
++    if(utf8)
++        OPENSSL_free(utf8);
++    
++    if(!success)
++        fprintf(stdout, "  %s: <not available>\n", label);
++}
++
++void print_san_name(const char* label, X509* const cert)
++{
++    int success = 0;
++    GENERAL_NAMES* names = NULL;
++    unsigned char* utf8 = NULL;
++    
++    do
++    {
++        if(!cert) break; /* failed */
++        
++        names = X509_get_ext_d2i(cert, NID_subject_alt_name, 0, 0 );
++        if(!names) break;
++        
++        int i = 0, count = sk_GENERAL_NAME_num(names);
++        if(!count) break; /* failed */
++        
++        for( i = 0; i < count; ++i )
++        {
++            GENERAL_NAME* entry = sk_GENERAL_NAME_value(names, i);
++            if(!entry) continue;
++            
++            if(GEN_DNS == entry->type)
++            {
++                int len1 = 0, len2 = -1;
++                
++                len1 = ASN1_STRING_to_UTF8(&utf8, entry->d.dNSName);
++                if(utf8) {
++                    len2 = (int)strlen((const char*)utf8);
++                }
++                
++                if(len1 != len2) {
++                    fprintf(stderr, "  Strlen and ASN1_STRING size do not match (embedded null?): %d vs %d\n", len2, len1);
++                }
++                
++                /* If there's a problem with string lengths, then     */
++                /* we skip the candidate and move on to the next.     */
++                /* Another policy would be to fails since it probably */
++                /* indicates the client is under attack.              */
++                if(utf8 && len1 && len2 && (len1 == len2)) {
++                    fprintf(stdout, "  %s: %s\n", label, utf8);
++                    success = 1;
++                }
++                
++                if(utf8) {
++                    OPENSSL_free(utf8), utf8 = NULL;
++                }
++            }
++            else
++            {
++                fprintf(stderr, "  Unknown GENERAL_NAME type: %d\n", entry->type);
++            }
++        }
++
++    } while (0);
++    
++    if(names)
++        GENERAL_NAMES_free(names);
++    
++    if(utf8)
++        OPENSSL_free(utf8);
++    
++    if(!success)
++        fprintf(stdout, "  %s: <not available>\n", label);
++    
++}
++
++int verify_callback(int preverify, X509_STORE_CTX* x509_ctx)
++{
++    /* For error codes, see http://www.openssl.org/docs/apps/verify.html  */
++    
++    int depth = X509_STORE_CTX_get_error_depth(x509_ctx);
++    int err = X509_STORE_CTX_get_error(x509_ctx);
++    
++    X509* cert = X509_STORE_CTX_get_current_cert(x509_ctx);
++    X509_NAME* iname = cert ? X509_get_issuer_name(cert) : NULL;
++    X509_NAME* sname = cert ? X509_get_subject_name(cert) : NULL;
++    
++    fprintf(stdout, "verify_callback (depth=%d)(preverify=%d)\n", depth, preverify);
++    
++    /* Issuer is the authority we trust that warrants nothing useful */
++    print_cn_name("Issuer (cn)", iname);
++    
++    /* Subject is who the certificate is issued to by the authority  */
++    print_cn_name("Subject (cn)", sname);
++    
++    if(depth == 0) {
++        /* If depth is 0, its the server's certificate. Print the SANs */
++        print_san_name("Subject (san)", cert);
++    }
++    
++    if(preverify == 0)
++    {
++        if(err == X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY)
++            fprintf(stdout, "  Error = X509_V_ERR_UNABLE_TO_GET_ISSUER_CERT_LOCALLY\n");
++        else if(err == X509_V_ERR_CERT_UNTRUSTED)
++            fprintf(stdout, "  Error = X509_V_ERR_CERT_UNTRUSTED\n");
++        else if(err == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN)
++            fprintf(stdout, "  Error = X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN\n");
++        else if(err == X509_V_ERR_CERT_NOT_YET_VALID)
++            fprintf(stdout, "  Error = X509_V_ERR_CERT_NOT_YET_VALID\n");
++        else if(err == X509_V_ERR_CERT_HAS_EXPIRED)
++            fprintf(stdout, "  Error = X509_V_ERR_CERT_HAS_EXPIRED\n");
++        else if(err == X509_V_OK)
++            fprintf(stdout, "  Error = X509_V_OK\n");
++        else
++            fprintf(stdout, "  Error = %d\n", err);
++    }
++
++    return preverify;
++}
++
++
++#endif
+\ No newline at end of file

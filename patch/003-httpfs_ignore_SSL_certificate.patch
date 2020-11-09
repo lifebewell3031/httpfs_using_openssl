@@ -1,0 +1,11 @@
+--- a/httpfs2.c	2020-09-30 14:24:25.637634254 +0800
++++ b/httpfs2.c	2020-09-30 14:09:03.024491276 +0800
+@@ -1115,7 +1115,7 @@
+                 return -1;
+             }
+ 
+-            SSL_CTX_set_verify(url->ctx, SSL_VERIFY_PEER, verify_callback);
++            SSL_CTX_set_verify(url->ctx, SSL_VERIFY_NONE, NULL);
+ 
+             if(!SSL_CTX_load_verify_locations(url->ctx, url->cafile, NULL))
+                 ERR_print_errors(url->bio_err);

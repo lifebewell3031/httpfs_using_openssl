@@ -1,0 +1,207 @@
+--- a/httpfs2.c	2020-08-27 17:41:13.266154655 +0800
++++ b/httpfs2.c	2020-08-27 17:43:57.279801197 +0800
+@@ -104,9 +104,11 @@
+     int proto;
+     long timeout;
+     char * host; /*hostname*/
++    char * req_host; /* hostname for ipv6 when sending http msg using.*/
+     int port;
+     char * path; /*get path*/
+     char * name; /*file name*/
++    int use_ipv6;
+ #ifdef USE_AUTH
+     char * auth; /*encoded auth data*/
+ #endif
+@@ -491,7 +493,7 @@
+ #endif
+     return 0;
+ }
+-#if 0
++
+ static int free_url(struct_url* url)
+ {
+     if(url->host) free(url->host);
+@@ -500,6 +502,8 @@
+     url->path = 0;
+     if(url->name) free(url->name);
+     url->name = 0;
++    if(url->req_host) free(url->req_host);
++    url->req_host = 0;
+ #ifdef USE_AUTH
+     if(url->auth) free(url->auth);
+     url->auth = 0;
+@@ -512,7 +516,6 @@
+     url->last_modified=0;
+     return 0;
+ }
+-#endif
+ static void print_url(FILE *f, const struct_url * url)
+ {
+     char * protocol = "?!?";
+@@ -580,8 +583,41 @@
+     }
+ #endif /* USE_AUTH */
+ 
++    /* Get the host name either ipv4 or ipv6 */
++    if (url == strchr(url, ':')){ /*no hastname in the url */
++        fprintf(stderr, "No hostname in url: %s\n", url_orig);
++        return -1;
++    }else if ((strchr(url, '[')) && (strchr(url, '[') < strchr(url, ':')) && (strchr(url, '[') < strchr(url,']'))){
++        /*
++         * get host name of ipv6
++         * [ipv6:ip:address:format] => 128bits , may double column if zero.
++         */
++        res->use_ipv6 = 1;
++
++        /* url = ipv6:format::::]:($port)/path */
++        url = strchr(url, '[') + 1; 
++        res->host = strndup(url, (size_t)(strchr(url, ']') - url));
++        /* url = :($port)/path or /path*/
++        url = strchr(url, ']') + 1; 
++
++        res->req_host = calloc(strlen(res->host) + 2, sizeof(char));
++        if (!res->req_host) return -1;
++        snprintf(res->req_host, strlen(res->host) + 3, "[%s]", res->host);
++        /* res->req_host is including '[' and ']' */
++
++    }else{ /* ipv4 format */
++        res->use_ipv6 = 0;
++        if(strchr(url, ':')) //with port number
++            res->host = strndup(url, (size_t)(strchr(url, ':') - url));
++        else //without port number
++            res->host = strndup(url, (size_t)(strchr(url, '/') - url));
++    }
++    
++    
++
++
+     /* Get port number. */
+-    int host_end = path_start;
++    //int host_end = path_start;
+     if(strchr(url, ':') && (strchr(url, ':') < strchr(url, path_start))){
+         /* FIXME check that port is a valid numeric value */
+         res->port = atoi(strchr(url, ':') + 1);
+@@ -589,14 +625,10 @@
+             fprintf(stderr, "Invalid port in url: %s\n", url_orig);
+             return -1;
+         }
+-        host_end = ':';
++        //host_end = ':';
+     }
+     /* Get the host name. */
+-    if (url == strchr(url, host_end)){ /*no hastname in the url */
+-        fprintf(stderr, "No hostname in url: %s\n", url_orig);
+-        return -1;
+-    }
+-    res->host = strndup(url, (size_t)(strchr(url, host_end) - url));
++    
+ 
+     /* Get the file name. */
+     url = strchr(url, path_start);
+@@ -626,6 +658,9 @@
+                 "[-a file] [-d n] [-5] [-2] "
+ #endif
+                 "[-f] [-t timeout] [-r] url mount-parameters\n\n", argv0);
++        fprintf(stderr, "\t httpfs2 accept ipv6 address (need Square brackets) & ipv4 address.\n");
++        fprintf(stderr, "\t Ex : \n");
++        fprintf(stderr, "\t\thttpfs2 http://[ipv6_ipaddr]/path OR httpfs2 http://ipv4_ipaddr/path \n\n");
+         fprintf(stderr, "\t -c \tuse console for standard input/output/error (default: %s)\n", CONSOLE);
+ #ifdef USE_SSL
+         fprintf(stderr, "\t -a \tCA file used to verify server certificate\n");
+@@ -713,27 +748,26 @@
+         return 1;
+     }
+     if(parse_url(argv[1], &main_url) == -1){
++        free_url(&main_url);
+         fprintf(stderr, "invalid url: %s\n", argv[1]);
+         return 2;
+     }
+     print_url(stderr, &main_url);
+     int sockfd = open_client_socket(&main_url);
+     if(sockfd < 0) {
++        free_url(&main_url);
+         cleanup(&main_url);
+         fprintf(stderr, "Connection failed.\n");
+         return 3;
+     }
+-#ifdef USE_SSL
+-    //else {
+-    //    print_ssl_info(main_url.ss);
+-    //}
+-#endif
++
+     close_client_socket(&main_url);
+     struct stat st;
+     off_t size = get_stat(&main_url, &st);
+     if(size >= 0) {
+         fprintf(stderr, "file size: \t%" PRIdMAX "\n", (intmax_t)size);
+     }else{
++        free_url(&main_url);
+         return 3;
+     }
+ 
+@@ -800,7 +834,7 @@
+         }
+     }
+     fuse_opt_free_args(&args);
+-
++    free_url(&main_url);
+     return err ? err : 0;
+ }
+ 
+@@ -981,6 +1015,7 @@
+     (void) memset((void*) &sa, 0, sizeof(sa));
+ 
+ #ifdef USE_IPV6
++
+     (void) memset(&hints, 0, sizeof(hints));
+     hints.ai_family = PF_UNSPEC;
+     hints.ai_socktype = SOCK_STREAM;
+@@ -997,8 +1032,8 @@
+             break;
+         if ((aiv4->ai_family == AF_INET6) && (aiv6 == NULL))
+             aiv6 = aiv4;
+-    }
+-
++    }    
++    
+     /* If there's an IPv4 address, use that, otherwise try IPv6. */
+     if (aiv4 == NULL)
+         aiv4 = aiv6;
+@@ -1019,6 +1054,7 @@
+     sock_type = aiv4->ai_socktype;
+     sock_protocol = aiv4->ai_protocol;
+     sa_len = aiv4->ai_addrlen;
++
+     (void) memmove(&sa, aiv4->ai_addr, sa_len);
+     freeaddrinfo(ai);
+ 
+@@ -1076,6 +1112,7 @@
+             if (url->ctx == NULL) {
+                 ERR_print_errors(url->bio_err);
+                 cleanup(url);
++                return -1;
+             }
+ 
+             SSL_CTX_set_verify(url->ctx, SSL_VERIFY_PEER, verify_callback);
+@@ -1264,9 +1301,10 @@
+     int range = (end > 0);
+ 
+     /* Build request buffer, starting with the request method. */
+-
++    
+     bytes = (size_t)snprintf(buf, HEADER_SIZE, "%s %s HTTP/1.1\r\nHost: %s\r\n",
+-            method, url->path, url->host);
++        method, url->path, (url->use_ipv6)? url->req_host : url->host);
++    
+     bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
+             "User-Agent: %s %s\r\n", __FILE__, VERSION);
+     if (range) bytes += (size_t)snprintf(buf + bytes, HEADER_SIZE - bytes,
+@@ -1425,6 +1463,7 @@
+         url->ctx = NULL;
+     }
+     url->ssl_connected = 0; 
++    
+ }
+ 
+ void print_cn_name(const char* label, X509_NAME* const name)
