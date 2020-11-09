@@ -1,1 +1,2 @@
-this project is working achivement, not public.
+please ref .tar.gz file, the origin APIs fo gnutls is changed to APIs of OpenSSL, for OpenSSL1.0.1p, but OpenSSL1.1.1 can use it too.
+
