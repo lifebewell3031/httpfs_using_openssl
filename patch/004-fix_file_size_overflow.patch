@@ -1,0 +1,20 @@
+--- a/httpfs2.c	2020-12-03 13:56:23.334193021 +0800
++++ b/httpfs2.c	2020-12-03 13:56:20.262227788 +0800
+@@ -249,7 +249,7 @@
+  * The FUSE operations originally ripped from the hello_ll sample.
+  */
+ 
+-static int httpfs_stat(fuse_ino_t ino, struct stat *stbuf)
++static off_t httpfs_stat(fuse_ino_t ino, struct stat *stbuf)
+ {
+     stbuf->st_ino = ino;
+     switch (ino) {
+@@ -262,7 +262,7 @@
+                     struct_url * url = thread_setup();
+                     stbuf->st_mode = S_IFREG | 0444;
+                     stbuf->st_nlink = 1;
+-                    return (int) get_stat(url, stbuf);
++                    return get_stat(url, stbuf);
+                 }; break;
+ 
+         default:
